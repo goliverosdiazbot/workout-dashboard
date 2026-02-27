@@ -2241,10 +2241,22 @@ async function doLogin() {
   var pass  = document.getElementById('liPass').value;
   if (!email || !pass) { showAuthErr('Completá todos los campos.'); return; }
   setAuthLoading('liBtn', true);
-  var { data, error } = await SB.auth.signInWithPassword({ email, password: pass });
-  setAuthLoading('liBtn', false);
-  if (error) { showAuthErr(error.message === 'Invalid login credentials' ? 'Email o contraseña incorrectos.' : error.message); return; }
-  await loadAndLoginUser(data.user);
+  try {
+    var { data, error } = await SB.auth.signInWithPassword({ email, password: pass });
+    setAuthLoading('liBtn', false);
+    if (error) {
+      var msg = error.message === 'Invalid login credentials' ? 'Email o contraseña incorrectos.' :
+                error.message === 'Email not confirmed' ? 'Confirmá tu email antes de ingresar (revisá spam).' :
+                error.message;
+      showAuthErr(msg); return;
+    }
+    if (!data || !data.user) { showAuthErr('Error inesperado. Intentá de nuevo.'); return; }
+    await loadAndLoginUser(data.user);
+  } catch(err) {
+    setAuthLoading('liBtn', false);
+    showAuthErr('Error de conexión. Verificá tu internet.');
+    console.error('doLogin error:', err);
+  }
 }
 
 async function doRegister() {
@@ -2255,19 +2267,28 @@ async function doRegister() {
   if (pass.length < 6) { showAuthErr('La contraseña debe tener al menos 6 caracteres.'); return; }
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { showAuthErr('Email inválido.'); return; }
   setAuthLoading('rgBtn', true);
-  var { data, error } = await SB.auth.signUp({ email, password: pass, options: { data: { name } } });
-  setAuthLoading('rgBtn', false);
-  if (error) { showAuthErr(error.message); return; }
-  // Email confirmation required
-  if (data.user && !data.session) {
-    document.getElementById('authErr').style.color = '#10b981';
-    showAuthErr('✓ ¡Cuenta creada! Revisá tu email para confirmar y luego iniciá sesión.');
-    return;
+  try {
+    var { data, error } = await SB.auth.signUp({ email, password: pass, options: { data: { name } } });
+    setAuthLoading('rgBtn', false);
+    if (error) { showAuthErr(error.message); return; }
+    // Si hay sesión directa (confirmación desactivada), entrar
+    if (data.user && data.session) {
+      await SB.from('profiles').upsert({ id: data.user.id, name: name, plan: 'free', hr_max: 190 }, { onConflict: 'id' });
+      await loadAndLoginUser(data.user);
+      return;
+    }
+    // Email confirmation requerido
+    if (data.user && !data.session) {
+      document.getElementById('authErr').style.color = '#10b981';
+      showAuthErr('✓ ¡Cuenta creada! Revisá tu email (y spam) para confirmar y luego iniciá sesión.');
+      return;
+    }
+    showAuthErr('Error al crear cuenta. Intentá de nuevo.');
+  } catch(err) {
+    setAuthLoading('rgBtn', false);
+    showAuthErr('Error de conexión. Verificá tu internet.');
+    console.error('doRegister error:', err);
   }
-  if (!data.user) { showAuthErr('Error al crear cuenta. Intentá de nuevo.'); return; }
-  // Upsert profile manually (in case trigger didn't fire)
-  await SB.from('profiles').upsert({ id: data.user.id, name: name }, { onConflict: 'id' });
-  await loadAndLoginUser(data.user);
 }
 
 function doDemo() {
@@ -2276,33 +2297,47 @@ function doDemo() {
 }
 
 async function loadAndLoginUser(sbUser) {
-  // Load profile from Supabase
-  var { data: profile, error: profErr } = await SB.from('profiles').select('*').eq('id', sbUser.id).single();
-  // If profile doesn't exist yet (trigger may not have fired), create it
-  if (profErr || !profile) {
-    var defaultName = sbUser.user_metadata && sbUser.user_metadata.name
-      ? sbUser.user_metadata.name
-      : sbUser.email.split('@')[0];
-    var { data: newProf } = await SB.from('profiles').upsert(
-      { id: sbUser.id, name: defaultName, plan: 'free', hr_max: 190 },
-      { onConflict: 'id' }
-    ).select().single();
-    profile = newProf;
+  try {
+    // Load profile from Supabase
+    var { data: profile, error: profErr } = await SB.from('profiles').select('*').eq('id', sbUser.id).single();
+    // If profile doesn't exist yet, create it
+    if (profErr || !profile) {
+      var defaultName = sbUser.user_metadata && sbUser.user_metadata.name
+        ? sbUser.user_metadata.name
+        : sbUser.email.split('@')[0];
+      var upsertRes = await SB.from('profiles').upsert(
+        { id: sbUser.id, name: defaultName, plan: 'free', hr_max: 190 },
+        { onConflict: 'id' }
+      ).select().single();
+      profile = upsertRes.data || null;
+    }
+    var user = {
+      uid:   sbUser.id,
+      email: sbUser.email,
+      name:  (profile && profile.name) || sbUser.email.split('@')[0],
+      plan:  (profile && profile.plan) || 'free',
+      hrMax: (profile && profile.hr_max) || 190,
+      age:   (profile && profile.age) || '',
+      weight:(profile && profile.weight) || '',
+      avatar:(profile && profile.avatar) || null,
+      sport: (profile && profile.sport) || '',
+      goal:  (profile && profile.goal) || '',
+      level: (profile && profile.level) || ''
+    };
+    loginUser(user);
+  } catch(err) {
+    console.error('loadAndLoginUser error:', err);
+    // Fallback: login with basic info so spinner doesn't hang forever
+    var fallbackUser = {
+      uid:   sbUser.id,
+      email: sbUser.email,
+      name:  (sbUser.user_metadata && sbUser.user_metadata.name) || sbUser.email.split('@')[0],
+      plan:  'free',
+      hrMax: 190,
+      age: '', weight: '', avatar: null, sport: '', goal: '', level: ''
+    };
+    loginUser(fallbackUser);
   }
-  var user = {
-    uid:   sbUser.id,
-    email: sbUser.email,
-    name:  (profile && profile.name) || sbUser.email.split('@')[0],
-    plan:  (profile && profile.plan) || 'free',
-    hrMax: (profile && profile.hr_max) || 190,
-    age:   (profile && profile.age) || '',
-    weight:(profile && profile.weight) || '',
-    avatar:(profile && profile.avatar) || null,
-    sport: (profile && profile.sport) || '',
-    goal:  (profile && profile.goal) || '',
-    level: (profile && profile.level) || ''
-  };
-  loginUser(user);
 }
 
 // ── DATA PERSISTENCE (Supabase) ────────────────────────────────────────
