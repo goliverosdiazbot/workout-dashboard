@@ -2621,6 +2621,12 @@ async function loginUser(user) {
   var auth = document.getElementById('authScreen');
   auth.classList.add('hide');
   setTimeout(function() { auth.style.display = 'none'; }, 400);
+
+  // Re-render multiple times after layout settles to fix blank charts
+  // Charts need real offsetWidth which is 0 while auth screen is visible
+  setTimeout(function(){ try{ renderAll(); }catch(e){} }, 450);
+  setTimeout(function(){ try{ renderAll(); }catch(e){} }, 900);
+  setTimeout(function(){ try{ renderAll(); }catch(e){} }, 1600);
 }
 
 function updateUserUI() {
@@ -2930,6 +2936,11 @@ function toggleSidebar(){
   btn.classList.toggle('open',!collapsed);
   setTimeout(function(){ try{ renderAll(); }catch(e){} }, 280);
 }
+
+window.addEventListener('resize', function(){
+  clearTimeout(window._resizeTimer);
+  window._resizeTimer = setTimeout(function(){ try{ renderAll(); }catch(e){} }, 150);
+});
 
 window.addEventListener('DOMContentLoaded',function(){
   // Init is now handled by auth system (loginUser)
