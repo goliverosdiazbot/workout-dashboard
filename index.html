@@ -1079,7 +1079,7 @@ var impMode='merge',impParsed=[];
 var GX='#e2e8f8',TX='#94a3b8';
 function fmtN(n){if(n>=1000)return Math.round(n/100)/10+'k';return Math.round(n);}
 function fmtD(s){if(!s)return '--';var h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h?h+'h '+m+'m':m+'m';}
-function sw(w){return w.replace(/\d{4}-/,'');}
+function sw(w){return w?w.replace(/\d{4}-/,''):'';}
 function gcol(a){return COLS[a]||'#6366f1';}
 function uqW(d){var s={},o=[];for(var i=0;i<d.length;i++)if(!s[d[i].week]){s[d[i].week]=1;o.push(d[i].week);}return o.sort();}
 function byw(d){var m={};for(var i=0;i<d.length;i++){var w=d[i].week;if(!m[w])m[w]=[];m[w].push(d[i]);}return m;}
@@ -2271,24 +2271,44 @@ async function doRegister() {
     var { data, error } = await SB.auth.signUp({ email, password: pass, options: { data: { name } } });
     setAuthLoading('rgBtn', false);
     if (error) { showAuthErr(error.message); return; }
-    // Si hay sesión directa (confirmación desactivada), entrar
-    if (data.user && data.session) {
-      await SB.from('profiles').upsert({ id: data.user.id, name: name, plan: 'free', hr_max: 190 }, { onConflict: 'id' });
-      await loadAndLoginUser(data.user);
+    if (!data || !data.user) { showAuthErr('Error al crear cuenta. Intentá de nuevo.'); return; }
+    // Si hay sesión directa (email confirm OFF), entrar directo
+    if (data.session) {
+      enterDashboardDirect(data.user, name);
       return;
     }
-    // Email confirmation requerido
-    if (data.user && !data.session) {
-      document.getElementById('authErr').style.color = '#10b981';
-      showAuthErr('✓ ¡Cuenta creada! Revisá tu email (y spam) para confirmar y luego iniciá sesión.');
+    // Sin sesión: intentar login inmediato (confirm email está OFF en Supabase)
+    var loginRes = await SB.auth.signInWithPassword({ email, password: pass });
+    if (loginRes.data && loginRes.data.session) {
+      enterDashboardDirect(loginRes.data.user, name);
       return;
     }
-    showAuthErr('Error al crear cuenta. Intentá de nuevo.');
+    // Fallback: mostrar mensaje
+    document.getElementById('authErr').style.color = '#10b981';
+    showAuthErr('✓ ¡Cuenta creada! Iniciá sesión con tu email y contraseña.');
   } catch(err) {
     setAuthLoading('rgBtn', false);
     showAuthErr('Error de conexión. Verificá tu internet.');
     console.error('doRegister error:', err);
   }
+}
+
+function enterDashboardDirect(sbUser, name) {
+  // Bypass all Supabase profile loading — go straight to dashboard
+  var user = {
+    uid:   sbUser.id,
+    email: sbUser.email,
+    name:  name || (sbUser.user_metadata && sbUser.user_metadata.name) || sbUser.email.split('@')[0],
+    plan:  'free',
+    hrMax: 190,
+    age: '', weight: '', avatar: null, sport: '', goal: '', level: ''
+  };
+  // Try to save profile in background (non-blocking)
+  SB.from('profiles').upsert(
+    { id: sbUser.id, name: user.name, plan: 'free', hr_max: 190 },
+    { onConflict: 'id' }
+  ).then(function() {}).catch(function() {});
+  loginUser(user);
 }
 
 function doDemo() {
@@ -2299,17 +2319,24 @@ function doDemo() {
 async function loadAndLoginUser(sbUser) {
   try {
     // Load profile from Supabase
-    var { data: profile, error: profErr } = await SB.from('profiles').select('*').eq('id', sbUser.id).single();
-    // If profile doesn't exist yet, create it
-    if (profErr || !profile) {
-      var defaultName = sbUser.user_metadata && sbUser.user_metadata.name
-        ? sbUser.user_metadata.name
-        : sbUser.email.split('@')[0];
-      var upsertRes = await SB.from('profiles').upsert(
-        { id: sbUser.id, name: defaultName, plan: 'free', hr_max: 190 },
-        { onConflict: 'id' }
-      ).select().single();
-      profile = upsertRes.data || null;
+    var profile = null;
+    try {
+      var { data: pd, error: profErr } = await SB.from('profiles').select('*').eq('id', sbUser.id).single();
+      if (!profErr && pd) {
+        profile = pd;
+      } else {
+        // Profile doesn't exist or RLS error — try to create it
+        var defaultName = sbUser.user_metadata && sbUser.user_metadata.name
+          ? sbUser.user_metadata.name
+          : sbUser.email.split('@')[0];
+        var upsertRes = await SB.from('profiles').upsert(
+          { id: sbUser.id, name: defaultName, plan: 'free', hr_max: 190 },
+          { onConflict: 'id' }
+        ).select().single();
+        profile = (upsertRes && upsertRes.data) ? upsertRes.data : null;
+      }
+    } catch(profileErr) {
+      console.warn('Profile load error (non-fatal):', profileErr);
     }
     var user = {
       uid:   sbUser.id,
@@ -2358,16 +2385,38 @@ async function getUserData(uid) {
 
 async function saveActivities(uid, rows) {
   if (uid === 'demo' || !rows.length) return;
+  function n(v, decimals) {
+    if (v === null || v === undefined || v === '') return null;
+    var parsed = parseFloat(v);
+    if (isNaN(parsed)) return null;
+    return decimals !== undefined ? parseFloat(parsed.toFixed(decimals)) : parsed;
+  }
   var records = rows.map(function(r) {
     return {
-      user_id: uid, date: r.date, week: r.week, activity: r.activity, title: r.title,
-      distance: r.distance || null, calories: r.calories || null, active_calories: r.active_calories || null,
-      duration: r.duration || null, hr_avg: r.hr_avg || null, hr_max_act: r.hr_max || null,
-      aerobic_te: r.aerobic_te || null, ascent: r.ascent || null, body_battery: r.body_battery || null, cadence: r.cadence || null
+      user_id: uid,
+      date: r.date,
+      week: r.week,
+      activity: r.activity,
+      title: r.title || null,
+      distance:         n(r.distance, 2),
+      calories:         n(r.calories, 0),
+      active_calories:  n(r.active_calories, 0),
+      duration:         n(r.duration, 0),
+      hr_avg:           n(r.hr_avg, 0),
+      hr_max_act:       n(r.hr_max, 0),
+      aerobic_te:       n(r.aerobic_te, 1),
+      ascent:           n(r.ascent, 0),
+      body_battery:     n(r.body_battery, 0),
+      cadence:          n(r.cadence, 0)
     };
   });
-  var { error } = await SB.from('activities').insert(records);
-  if (error) console.error('saveActivities error', error);
+  // Insert in batches of 100 to avoid request size limits
+  var batchSize = 100;
+  for (var i = 0; i < records.length; i += batchSize) {
+    var batch = records.slice(i, i + batchSize);
+    var { error } = await SB.from('activities').insert(batch);
+    if (error) { console.error('saveActivities error (batch ' + i + '):', error); }
+  }
 }
 
 async function replaceAllActivities(uid, rows) {
@@ -2435,6 +2484,13 @@ async function loginUser(user) {
     if (card) { card.style.position='relative'; card.appendChild(spinner); }
   }
 
+  // SAFETY NET: force-hide auth after 5 seconds no matter what
+  var safetyTimer = setTimeout(function() {
+    console.warn('Safety timeout: forcing dashboard open');
+    var auth = document.getElementById('authScreen');
+    if (auth) { auth.classList.add('hide'); setTimeout(function() { auth.style.display = 'none'; }, 400); }
+  }, 5000);
+
   // Update UI
   updateUserUI();
 
@@ -2461,11 +2517,12 @@ async function loginUser(user) {
   ['gapf','gbpf'].forEach(function(id) { var e = document.getElementById(id); if (e) { e.innerHTML = wo; e.value = WEEKS[0]; } });
   ['gapt','gbpt'].forEach(function(id) { var e = document.getElementById(id); if (e) { e.innerHTML = wo; e.value = WEEKS[WEEKS.length-1]; } });
   buildDropdown(); buildWGrid('a'); buildWGrid('b'); buildAGrid('a'); buildAGrid('b');
-  document.getElementById('ai-hd-sub').textContent = D.length + ' actividades · ' + sw(WEEKS[0]) + ' – ' + sw(WEEKS[WEEKS.length-1]);
+  document.getElementById('ai-hd-sub').textContent = D.length ? D.length + ' actividades · ' + sw(WEEKS[0]) + ' – ' + sw(WEEKS[WEEKS.length-1]) : 'Sin actividades · importá tu CSV';
   updateAIQuotaUI();
   renderAll();
 
   // Hide auth, show app
+  clearTimeout(safetyTimer);
   var auth = document.getElementById('authScreen');
   auth.classList.add('hide');
   setTimeout(function() { auth.style.display = 'none'; }, 400);
@@ -2661,7 +2718,7 @@ function resetToBuiltIn() {
   ['gapf','gbpf'].forEach(function(id) { var e = document.getElementById(id); if (e) { e.innerHTML = wo; e.value = WEEKS[0]; } });
   ['gapt','gbpt'].forEach(function(id) { var e = document.getElementById(id); if (e) { e.innerHTML = wo; e.value = WEEKS[WEEKS.length-1]; } });
   buildDropdown(); buildWGrid('a'); buildWGrid('b'); buildAGrid('a'); buildAGrid('b');
-  document.getElementById('ai-hd-sub').textContent = D.length + ' actividades · ' + sw(WEEKS[0]) + ' – ' + sw(WEEKS[WEEKS.length-1]);
+  document.getElementById('ai-hd-sub').textContent = D.length ? D.length + ' actividades · ' + sw(WEEKS[0]) + ' – ' + sw(WEEKS[WEEKS.length-1]) : 'Sin actividades · importá tu CSV';
   updateAIQuotaUI();
   renderAll();
   selTypes = null; fData = D.slice();
